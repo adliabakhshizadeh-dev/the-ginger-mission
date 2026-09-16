@@ -1,21 +1,27 @@
 import os
-import re
+import asyncio
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
     filters,
 )
 
-# =========================
-# تنظیمات
-# =========================
 
-TOKEN = os.getenv("BOT_TOKEN")
+# =========================================================
+# TOKEN
+# =========================================================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+
+# =========================================================
+# QUESTIONS
+# =========================================================
 
 QUESTIONS = [
     {
@@ -52,490 +58,866 @@ QUESTIONS = [
     },
 ]
 
-# اطلاعات هر بازیکن
+
+# =========================================================
+# PLAYER DATA
+# =========================================================
+
 players = {}
+player_locks = {}
+
+
+def get_lock(user_id):
+    if user_id not in player_locks:
+        player_locks[user_id] = asyncio.Lock()
+
+    return player_locks[user_id]
 
 
 def new_player():
     return {
         "coins": 15,
         "current_question": 0,
+
         "hints_used": [0] * 8,
         "answered": [False] * 8,
         "skipped": [False] * 8,
+
         "question_message_id": None,
+
+        "stats": {
+            "no_hint": 0,
+            "one_hint": 0,
+            "two_hints": 0,
+            "skipped": 0,
+        },
+
+        "finished": False,
     }
 
 
-def get_player(user_id):
-    if user_id not in players:
-        players[user_id] = new_player()
-    return players[user_id]
+# =========================================================
+# ANSWER NORMALIZATION
+# =========================================================
+
+def normalize(text):
+    return " ".join(text.strip().lower().split())
 
 
-# =========================
-# متن‌ها
-# =========================
-
-START_TEXT = """عیال خوشگل من،
-تولدت مبارک باشه💕
-آماده‌ای کادوی تولدتو بگیری؟
-اگه آماده‌ای، دکمه‌ی زیر رو فشار بده."""
-
-RULES_TEXT = """قبل از گرفتن کادوی اصلی، باید یه جدول رو کامل کنی.🧩
-
-این جدول از **هشت‌تا سوال** تشکیل شده.
-هر جواب درستی که بدی، چندتا **سکه 🪙** به کیف پولت اضافه میشه. (از اول بازی کیف پولت **پونزده‌تا سکه** اعتبار داره.)
-
-این سکه‌ها به چه دردی میخورن👀؟ میتونی باهاشون **هینت** بخری.
-
-اینطوری که با خرج کردن **پنج‌تا سکه** میتونی حرف اول یه جواب رو نمایان کنی.
-اما حواست باشه، اگه پنج‌تا سکه بدی و حرف اول رو نمایان کنی، برای دوباره هینت گرفتن و نمایان کردن حرف دوم باید **هشت سکه** بپردازی.
-
-تعداد سکه‌هایی که از جواب دادن سوال‌ها میگیری هم به تعداد هینت‌هایی که استفاده کردی بستگی داره!✨
-
-اگه **هیچ هینتی** استفاده نکرده باشی ← **چهار سکه** جایزه‌ته! 🪙
-اگه **یدونه از حروف** رو با هینت باز کرده باشی ← **سه سکه** جایزه‌ته! 🪙
-اگه **دوتا از حروف** رو با هینت باز کرده باشی ← **دوتا سکه** جایزه‌ته! 🪙
-
-‼️اماااا‼️
-
-اگه سوالی رو رد کنی و جوابشو ندونی، **ده تا سکه** به عنوان جریمه از کیف پولت کم میشه.
-پس رد کردن سوال خیلی هم به نفعت نیست...
-
-در نهایت، **تعداد سکه‌های باقی مونده جایزه‌ی اضافه‌ای برات دارن!** 🪙"""
+def is_correct(user_answer, correct_answer):
+    return normalize(user_answer) == normalize(correct_answer)
 
 
-# =========================
-# /start
-# =========================
+# =========================================================
+# START
+# =========================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     user_id = update.effective_user.id
 
     players[user_id] = new_player()
 
     keyboard = [
-        [InlineKeyboardButton("آماده‌ام!", callback_data="ready")]
+        [
+            InlineKeyboardButton(
+                "آماده‌ام!",
+                callback_data="ready"
+            )
+        ]
     ]
 
     await update.message.reply_text(
-        START_TEXT,
+        "عیال خوشگل من،\n"
+        "تولدت مبارک باشه💕\n"
+        "آماده‌ای کادوی تولدتو بگیری؟\n"
+        "اگه آماده‌ای، دکمه‌ی زیر رو فشار بده.",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
-# =========================
-# شروع مأموریت
-# =========================
+# =========================================================
+# READY
+# =========================================================
 
 async def ready(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     query = update.callback_query
+
     await query.answer()
 
-    keyboard = [
-        [InlineKeyboardButton("شروع مأموریت 🧩", callback_data="start_mission")]
-    ]
+    text = (
+        "قبل از گرفتن کادوی اصلی، باید یه جدول رو کامل کنی.🧩\n\n"
 
-    await query.message.reply_text(
-        RULES_TEXT,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown",
+        "این جدول از **هشت‌تا سوال** تشکیل شده.\n"
+        "هر جواب درستی که بدی، چندتا **سکه 🪙** به کیف پولت اضافه میشه. "
+        "(از اول بازی کیف پولت **پونزده‌تا سکه** اعتبار داره.)\n\n"
+
+        "این سکه‌ها به چه دردی میخورن👀؟ "
+        "میتونی باهاشون **راهنمایی** بخری.\n\n"
+
+        "اینطوری که با خرج کردن **پنج‌تا سکه** "
+        "میتونی حرف اول یه جواب رو نمایان کنی.\n"
+        "اما حواست باشه، اگه پنج‌تا سکه بدی و حرف اول رو نمایان کنی، "
+        "برای دوباره راهنمایی گرفتن و نمایان کردن حرف دوم "
+        "باید **هشت سکه** بپردازی.\n\n"
+
+        "تعداد سکه‌هایی که از جواب دادن سوال‌ها میگیری هم "
+        "به تعداد راهنمایی‌هایی که استفاده کردی بستگی داره!✨\n\n"
+
+        "اگه **هیچ راهنمایی** استفاده نکرده باشی "
+        "← **چهار سکه** جایزه‌ته! 🪙\n"
+
+        "اگه **یدونه از حروف** رو با راهنمایی باز کرده باشی "
+        "← **سه سکه** جایزه‌ته! 🪙\n"
+
+        "اگه **دوتا از حروف** رو با راهنمایی باز کرده باشی "
+        "← **دوتا سکه** جایزه‌ته! 🪙\n\n"
+
+        "‼️اماااا‼️\n\n"
+
+        "اگه سوالی رو رد کنی و جوابشو ندونی، "
+        "**ده تا سکه** به عنوان جریمه از کیف پولت کم میشه.\n"
+        "پس رد کردن سوال خیلی هم به نفعت نیست...\n\n"
+
+        "در نهایت، **تعداد سکه‌های باقی مونده جایزه‌ی اضافه‌ای برات دارن!** 🪙"
     )
-
-
-# =========================
-# نمایش سؤال
-# =========================
-
-async def show_question(update, context, user_id):
-    player = get_player(user_id)
-    index = player["current_question"]
-    q = QUESTIONS[index]
-
-    hidden = "_" * len(q["answer"])
-
-    text = f"""🧩 **سؤال {index + 1} از ۸**
-
-{q["question"]}
-
-**جوابت رو روی این پیام ریپلای کن!**
-
-{hidden}
-
-🪙 **کیف پول: {player["coins"]} سکه**"""
 
     keyboard = [
         [
-            InlineKeyboardButton("هینت 🪙", callback_data=f"hint:{index}"),
-            InlineKeyboardButton("رد کردن ⏭️", callback_data=f"skip:{index}"),
+            InlineKeyboardButton(
+                "شروع مأموریت 🧩",
+                callback_data="start_mission"
+            )
+        ]
+    ]
+
+    await query.message.reply_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+# =========================================================
+# START MISSION
+# =========================================================
+
+async def start_mission(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    async with get_lock(user_id):
+
+        await query.answer()
+
+        players[user_id] = new_player()
+
+        await query.message.reply_text(
+            "**مأموریت شروع شد!** 🫡🫚",
+            parse_mode="Markdown",
+        )
+
+        await show_question(context, user_id)
+
+
+# =========================================================
+# SHOW QUESTION
+# =========================================================
+
+async def show_question(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int
+):
+
+    player = players.get(user_id)
+
+    if not player:
+        return
+
+    index = player["current_question"]
+
+    if index >= len(QUESTIONS):
+        await finish_questions(context, user_id)
+        return
+
+    question = QUESTIONS[index]
+
+    text = (
+        f"🧩 **سوال {index + 1} از ۸**\n\n"
+        f"{question['question']}\n\n"
+        "جوابت رو روی این پیام ریپلای کن!\n\n"
+        f"🪙 **کیف پول: {player['coins']} سکه**"
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "راهنمایی 🪙",
+                callback_data=f"hint:{index}"
+            ),
+            InlineKeyboardButton(
+                "رد کردن ⏭️",
+                callback_data=f"skip:{index}"
+            ),
         ]
     ]
 
     message = await context.bot.send_message(
         chat_id=user_id,
         text=text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
     player["question_message_id"] = message.message_id
 
 
-async def start_mission(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+# =========================================================
+# CHECK ANSWER
+# =========================================================
 
-    user_id = query.from_user.id
-    player = get_player(user_id)
+async def check_answer(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    player["current_question"] = 0
-
-    await query.message.reply_text("مأموریت شروع شد! 🫡🫚")
-
-    await show_question(update, context, user_id)
-
-
-# =========================
-# هینت
-# =========================
-
-async def hint_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-    player = get_player(user_id)
-
-    index = int(query.data.split(":")[1])
-
-    # اگر سؤال فعلی نیست
-    if index != player["current_question"]:
-        await query.answer("این سؤال دیگه فعال نیست! 👀", show_alert=True)
-        return
-
-    used = player["hints_used"][index]
-
-    if used >= 2:
-        await query.message.reply_text(
-            "اوپس، تو همه‌ی هینت‌هات رو استفاده کردی! "
-            "دیگه برای این سوال نمیتونی هینتی بخری."
-        )
-        return
-
-    cost = 5 if used == 0 else 8
-
-    keyboard = [
-        [
-            InlineKeyboardButton("بله", callback_data=f"buy_hint:{index}"),
-            InlineKeyboardButton("خیر", callback_data="cancel_hint"),
-        ]
-    ]
-
-    await query.message.reply_text(
-        f"برای هینت باید **{cost} سکه** پرداخت کنی.\n\n"
-        "از خرید هینت مطمئنی؟",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown",
-    )
-
-
-async def buy_hint(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-    player = get_player(user_id)
-
-    index = int(query.data.split(":")[1])
-    used = player["hints_used"][index]
-
-    cost = 5 if used == 0 else 8
-
-    if player["coins"] < cost:
-        await query.message.reply_text(
-            "اوپس! 🥲\n"
-            f"برای این هینت {cost} سکه لازم داری، "
-            f"ولی فقط {player['coins']} سکه توی کیف پولته."
-        )
-        return
-
-    player["coins"] -= cost
-    player["hints_used"][index] += 1
-
-    answer = QUESTIONS[index]["answer"]
-    shown = answer[:player["hints_used"][index]]
-
-    hidden = shown + "_" * (len(answer) - len(shown))
-
-    await query.message.reply_text(
-        f"✨ هینتت آماده‌ست!\n\n"
-        f"**{hidden}**\n\n"
-        f"🪙 کیف پول: **{player['coins']} سکه**",
-        parse_mode="Markdown",
-    )
-
-
-async def cancel_hint(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    await query.message.reply_text("باشه، هینت نمی‌خریم 👀")
-
-
-# =========================
-# رد کردن
-# =========================
-
-async def skip_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-    player = get_player(user_id)
-
-    index = int(query.data.split(":")[1])
-
-    if index != player["current_question"]:
-        await query.answer("این سؤال دیگه فعال نیست! 👀", show_alert=True)
-        return
-
-    keyboard = [
-        [
-            InlineKeyboardButton("بله", callback_data=f"confirm_skip:{index}"),
-            InlineKeyboardButton("خیر", callback_data="cancel_skip"),
-        ]
-    ]
-
-    await query.message.reply_text(
-        "مطمئنی می‌خوای این سوال رو رد کنی؟\n"
-        "با رد کردن این سوال، ۱۰ سکه از کیف پولت کم میشه.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-
-async def confirm_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-    player = get_player(user_id)
-
-    index = int(query.data.split(":")[1])
-
-    player["coins"] -= 10
-    player["skipped"][index] = True
-
-    answer = QUESTIONS[index]["answer"]
-
-    await query.message.reply_text(
-        f"⏭️ سوال رد شد.\n\n"
-        f"جواب درست: **{answer}**\n\n"
-        f"🪙 کیف پول: **{player['coins']} سکه**",
-        parse_mode="Markdown",
-    )
-
-    await next_question(user_id, context)
-
-
-async def cancel_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    await query.message.reply_text("باشه، پس این سوال رو نگه می‌داریم! 👀")
-
-
-# =========================
-# بررسی جواب
-# =========================
-
-def normalize(text):
-    text = text.strip().lower()
-    text = text.replace("ي", "ی")
-    text = text.replace("ك", "ک")
-    return re.sub(r"\s+", "", text)
-
-
-async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message:
-        return
-
+    message = update.message
     user_id = update.effective_user.id
-    player = get_player(user_id)
 
-    current = player["current_question"]
-    question_message_id = player["question_message_id"]
+    player = players.get(user_id)
 
-    # فقط ریپلای به سؤال فعلی قبول می‌شود
-    if update.message.reply_to_message.message_id != question_message_id:
+    if not player:
         return
 
-    correct_answer = QUESTIONS[current]["answer"]
-
-    if normalize(update.message.text) != normalize(correct_answer):
-        await update.message.reply_text("❌ جواب درست نیست! دوباره تلاش کن.")
+    if not message.reply_to_message:
         return
 
-    # اگر قبلاً جواب داده شده
-    if player["answered"][current]:
+    if message.reply_to_message.message_id != player["question_message_id"]:
         return
 
-    player["answered"][current] = True
+    async with get_lock(user_id):
 
-    hints = player["hints_used"][current]
+        # دوباره state را بعد از گرفتن lock بررسی می‌کنیم
+        player = players.get(user_id)
 
-    if hints == 0:
-        reward = 4
-    elif hints == 1:
-        reward = 3
-    else:
-        reward = 2
+        if not player:
+            return
 
-    player["coins"] += reward
+        index = player["current_question"]
 
-    await update.message.reply_text(
-        f"🎉 هورااا جوابت درست بود!\n\n"
-        f"+{reward} 🪙\n\n"
-        f"کیف پولت: {player['coins']} 🪙\n\n"
-        f"بریم سراغ سؤال بعدی؟ 👀",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("سؤال بعدی", callback_data="next_question")]]
-        ),
+        if index >= len(QUESTIONS):
+            return
+
+        if player["answered"][index]:
+            return
+
+        if player["skipped"][index]:
+            return
+
+        correct_answer = QUESTIONS[index]["answer"]
+
+        if not is_correct(message.text, correct_answer):
+
+            await message.reply_text(
+                "❌ جواب درست نیست! دوباره تلاش کن."
+            )
+
+            return
+
+        # علامت‌گذاری قبل از ارسال پیام
+        # تا جواب‌های تکراری نتوانند دوباره پردازش شوند.
+        player["answered"][index] = True
+
+        hints = player["hints_used"][index]
+
+        if hints == 0:
+
+            reward = 4
+            player["stats"]["no_hint"] += 1
+
+        elif hints == 1:
+
+            reward = 3
+            player["stats"]["one_hint"] += 1
+
+        else:
+
+            reward = 2
+            player["stats"]["two_hints"] += 1
+
+        player["coins"] += reward
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "سوال بعدی",
+                    callback_data=f"next:{index}"
+                )
+            ]
+        ]
+
+        await message.reply_text(
+            f"🎉 هورااا جوابت درست بود!\n\n"
+            f"+{reward} 🪙\n\n"
+            f"کیف پولت: {player['coins']} 🪙\n\n"
+            "بریم سراغ سؤال بعدی؟ 👀",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+
+# =========================================================
+# NEXT QUESTION
+# =========================================================
+
+async def next_question(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    async with get_lock(user_id):
+
+        player = players.get(user_id)
+
+        if not player:
+
+            await query.answer()
+            return
+
+        try:
+            button_index = int(
+                query.data.split(":")[1]
+            )
+
+        except (IndexError, ValueError):
+
+            await query.answer()
+            return
+
+        # دکمه باید متعلق به سؤال فعلی باشد.
+        if button_index != player["current_question"]:
+
+            await query.answer(
+                "این دکمه دیگه قابل استفاده نیست."
+            )
+
+            return
+
+        # سؤال باید قبلاً درست جواب داده شده باشد.
+        if not player["answered"][button_index]:
+
+            await query.answer(
+                "اول باید به این سوال جواب بدی."
+            )
+
+            return
+
+        await query.answer()
+
+        # فقط یک سؤال جلو می‌رویم.
+        player["current_question"] += 1
+
+        player["question_message_id"] = None
+
+        await show_question(
+            context,
+            user_id
+        )
+
+
+# =========================================================
+# HINT BUTTON
+# =========================================================
+
+async def hint_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    async with get_lock(user_id):
+
+        player = players.get(user_id)
+
+        if not player:
+
+            await query.answer()
+            return
+
+        try:
+            index = int(
+                query.data.split(":")[1]
+            )
+
+        except (IndexError, ValueError):
+
+            await query.answer()
+            return
+
+        if index != player["current_question"]:
+
+            await query.answer(
+                "این سوال دیگه فعال نیست."
+            )
+
+            return
+
+        used = player["hints_used"][index]
+
+        if used >= 2:
+
+            await query.answer()
+
+            await query.message.reply_text(
+                "اوپس، تو همه‌ی راهنمایی‌هات رو استفاده کردی! "
+                "دیگه برای این سوال نمیتونی راهنمایی بخری."
+            )
+
+            return
+
+        cost = 5 if used == 0 else 8
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "بله",
+                    callback_data=f"buy_hint:{index}"
+                ),
+                InlineKeyboardButton(
+                    "خیر",
+                    callback_data="cancel_hint"
+                ),
+            ]
+        ]
+
+        await query.answer()
+
+        await query.message.reply_text(
+            f"برای راهنمایی باید **{cost} سکه** پرداخت کنی. "
+            "از خرید راهنمایی مطمئنی؟",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+
+# =========================================================
+# BUY HINT
+# =========================================================
+
+async def buy_hint(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    async with get_lock(user_id):
+
+        player = players.get(user_id)
+
+        if not player:
+
+            await query.answer()
+            return
+
+        try:
+            index = int(
+                query.data.split(":")[1]
+            )
+
+        except (IndexError, ValueError):
+
+            await query.answer()
+            return
+
+        if index != player["current_question"]:
+
+            await query.answer(
+                "این سوال دیگه فعال نیست."
+            )
+
+            return
+
+        used = player["hints_used"][index]
+
+        if used >= 2:
+
+            await query.answer()
+            return
+
+        cost = 5 if used == 0 else 8
+
+        if player["coins"] < cost:
+
+            await query.answer(
+                "سکه‌هات برای این راهنمایی کافی نیست!",
+                show_alert=True,
+            )
+
+            return
+
+        player["coins"] -= cost
+
+        player["hints_used"][index] += 1
+
+        revealed = player["hints_used"][index]
+
+        answer = QUESTIONS[index]["answer"]
+
+        displayed = " ".join(
+            char if i < revealed else "＿"
+            for i, char in enumerate(answer)
+        )
+
+        await query.answer()
+
+        await query.message.reply_text(
+            f"🔎 **راهنمایی {revealed}:**\n\n"
+            f"{displayed}\n\n"
+            f"🪙 **کیف پول: {player['coins']} سکه**",
+            parse_mode="Markdown",
+        )
+
+
+# =========================================================
+# CANCEL HINT
+# =========================================================
+
+async def cancel_hint(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    await update.callback_query.answer(
+        "راهنمایی نخریدی 👀"
     )
 
 
-# =========================
-# سؤال بعدی
-# =========================
+# =========================================================
+# SKIP
+# =========================================================
 
-async def next_question_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def skip_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
     query = update.callback_query
-    await query.answer()
-
     user_id = query.from_user.id
-    await next_question(user_id, context)
+
+    async with get_lock(user_id):
+
+        player = players.get(user_id)
+
+        if not player:
+
+            await query.answer()
+            return
+
+        try:
+            index = int(
+                query.data.split(":")[1]
+            )
+
+        except (IndexError, ValueError):
+
+            await query.answer()
+            return
+
+        if index != player["current_question"]:
+
+            await query.answer(
+                "این سوال دیگه فعال نیست."
+            )
+
+            return
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "بله",
+                    callback_data=f"confirm_skip:{index}"
+                ),
+                InlineKeyboardButton(
+                    "خیر",
+                    callback_data="cancel_skip"
+                ),
+            ]
+        ]
+
+        await query.answer()
+
+        await query.message.reply_text(
+            "مطمئنی می‌خوای این سوال رو رد کنی؟\n"
+            "با رد کردن این سوال، **۱۰ سکه** "
+            "از کیف پولت کم میشه.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
 
 
-async def next_question(user_id, context):
-    player = get_player(user_id)
+# =========================================================
+# CONFIRM SKIP
+# =========================================================
 
-    player["current_question"] += 1
+async def confirm_skip(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    if player["current_question"] >= len(QUESTIONS):
-        await finish_questions(user_id, context)
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    async with get_lock(user_id):
+
+        player = players.get(user_id)
+
+        if not player:
+
+            await query.answer()
+            return
+
+        try:
+            index = int(
+                query.data.split(":")[1]
+            )
+
+        except (IndexError, ValueError):
+
+            await query.answer()
+            return
+
+        if index != player["current_question"]:
+
+            await query.answer(
+                "این سوال دیگه فعال نیست."
+            )
+
+            return
+
+        # جریمه
+        player["coins"] -= 10
+
+        player["skipped"][index] = True
+
+        player["stats"]["skipped"] += 1
+
+        correct_answer = QUESTIONS[index]["answer"]
+
+        await query.answer()
+
+        await query.message.reply_text(
+            f"⏭️ سوال رد شد.\n\n"
+            f"جواب درست: **{correct_answer}**\n\n"
+            f"🪙 **کیف پول: {player['coins']} سکه**",
+            parse_mode="Markdown",
+        )
+
+        player["current_question"] += 1
+
+        player["question_message_id"] = None
+
+        await show_question(
+            context,
+            user_id
+        )
+
+
+# =========================================================
+# CANCEL SKIP
+# =========================================================
+
+async def cancel_skip(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    await update.callback_query.answer(
+        "سوال رو رد نکردی 👀"
+    )
+
+
+# =========================================================
+# FINISH
+# =========================================================
+
+async def finish_questions(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int
+):
+
+    player = players.get(user_id)
+
+    if not player:
         return
 
-    await show_question(None, context, user_id)
+    # جلوگیری از ارسال دوباره‌ی پایان
+    if player["finished"]:
+        return
 
+    player["finished"] = True
 
-# =========================
-# پایان ۸ سؤال
-# =========================
+    stats = player["stats"]
 
-async def finish_questions(user_id, context):
-    player = get_player(user_id)
+    text = (
+        "آفرین خوشگلم، هشت‌تا سوال تموم شدن!🍭\n\n"
 
-    no_hint = 0
-    one_hint = 0
-    two_hint = 0
-    skipped = 0
+        f"🔸**تعداد سوالاتی که بدون راهنمایی جواب دادی:** "
+        f"{stats['no_hint']}\n"
 
-    for i in range(8):
-        if player["skipped"][i]:
-            skipped += 1
-        elif player["answered"][i]:
-            if player["hints_used"][i] == 0:
-                no_hint += 1
-            elif player["hints_used"][i] == 1:
-                one_hint += 1
-            else:
-                two_hint += 1
+        f"🔸**تعداد سوالاتی که با استفاده از یک راهنمایی جواب دادی:** "
+        f"{stats['one_hint']}\n"
 
-    text = f"""آفرین خوشگلم، هشت‌تا سوال تموم شدن!🍭
+        f"🔸**تعداد سوالاتی که با استفاده از دو راهنمایی جواب دادی:** "
+        f"{stats['two_hints']}\n"
 
-🔸تعداد سوالاتی که بدون هینت جواب دادی: {no_hint}
-🔸تعداد سوالاتی که با استفاده از یک هینت جواب دادی: {one_hint}
-🔸تعداد سوالاتی که با استفاده از دو هینت جواب دادی: {two_hint}
-🔸تعداد سوالاتی که ردشون کردی: {skipped}
-🪙موجودی فعلی کیف پولت: {player["coins"]} سکه
+        f"🔸**تعداد سوالاتی که ردشون کردی:** "
+        f"{stats['skipped']}\n"
 
-هر موقع آماده بودی روی دکمه‌ی زیر بزن تا جدول با استفاده از جوابات پر بشه و بتونی کلمه‌ی مخفی شده رو پیدا کنی❗"""
+        f"🪙**موجودی فعلی کیف پولت:** "
+        f"{player['coins']} سکه\n\n"
+
+        "هر موقع آماده بودی روی دکمه‌ی زیر بزن تا جدول "
+        "با استفاده از جوابات پر بشه و بتونی "
+        "کلمه‌ی مخفی شده رو پیدا کنی❗"
+    )
 
     keyboard = [
-        [InlineKeyboardButton("دیدن جدول", callback_data="show_table")]
+        [
+            InlineKeyboardButton(
+                "دیدن جدول",
+                callback_data="show_table"
+            )
+        ]
     ]
 
     await context.bot.send_message(
         chat_id=user_id,
         text=text,
+        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
-# =========================
-# جدول - فعلاً جای خالی
-# =========================
+# =========================================================
+# TABLE
+# فعلاً جای تصویر جدول
+# =========================================================
 
-async def show_table(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_table(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
     query = update.callback_query
+
     await query.answer()
 
     await query.message.reply_text(
-        "🧩 جدول اینجا قرار می‌گیره!\n\n"
-        "عکس جدول رو بعداً اضافه می‌کنیم. 👀"
+        "🧩 جدول رو بعداً با تصویر نهایی اضافه می‌کنیم."
     )
 
 
-# =========================
-# اجرای بات
-# =========================
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
-    if not TOKEN:
-        raise RuntimeError("BOT_TOKEN is not set!")
 
-    application = Application.builder().token(TOKEN).build()
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN is not set."
+        )
 
-    application.add_handler(CommandHandler("start", start))
-
-    application.add_handler(
-        CallbackQueryHandler(ready, pattern="^ready$")
+    application = (
+        Application
+        .builder()
+        .token(BOT_TOKEN)
+        .build()
     )
 
     application.add_handler(
-        CallbackQueryHandler(start_mission, pattern="^start_mission$")
+        CommandHandler("start", start)
     )
 
     application.add_handler(
-        CallbackQueryHandler(hint_button, pattern="^hint:")
+        CallbackQueryHandler(
+            ready,
+            pattern=r"^ready$"
+        )
     )
 
     application.add_handler(
-        CallbackQueryHandler(buy_hint, pattern="^buy_hint:")
+        CallbackQueryHandler(
+            start_mission,
+            pattern=r"^start_mission$"
+        )
     )
 
     application.add_handler(
-        CallbackQueryHandler(cancel_hint, pattern="^cancel_hint$")
+        CallbackQueryHandler(
+            hint_button,
+            pattern=r"^hint:\d+$"
+        )
     )
 
     application.add_handler(
-        CallbackQueryHandler(skip_button, pattern="^skip:")
+        CallbackQueryHandler(
+            buy_hint,
+            pattern=r"^buy_hint:\d+$"
+        )
     )
 
     application.add_handler(
-        CallbackQueryHandler(confirm_skip, pattern="^confirm_skip:")
+        CallbackQueryHandler(
+            cancel_hint,
+            pattern=r"^cancel_hint$"
+        )
     )
 
     application.add_handler(
-        CallbackQueryHandler(cancel_skip, pattern="^cancel_skip$")
+        CallbackQueryHandler(
+            skip_button,
+            pattern=r"^skip:\d+$"
+        )
     )
 
     application.add_handler(
-        CallbackQueryHandler(next_question_button, pattern="^next_question$")
+        CallbackQueryHandler(
+            confirm_skip,
+            pattern=r"^confirm_skip:\d+$"
+        )
     )
 
     application.add_handler(
-        CallbackQueryHandler(show_table, pattern="^show_table$")
+        CallbackQueryHandler(
+            cancel_skip,
+            pattern=r"^cancel_skip$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            next_question,
+            pattern=r"^next:\d+$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            show_table,
+            pattern=r"^show_table$"
+        )
     )
 
     application.add_handler(
@@ -549,6 +931,10 @@ def main():
 
     application.run_polling()
 
+
+# =========================================================
+# RUN
+# =========================================================
 
 if __name__ == "__main__":
     main()
